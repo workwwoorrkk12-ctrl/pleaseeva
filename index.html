@@ -277,6 +277,54 @@
   .fb-item.warn .fb-icon { color: var(--warn); }
   .fb-item.bad .fb-icon { color: var(--bad); }
 
+  /* ── 첨삭 (수정 전/후) ─────────────── */
+  .rev-zone { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .rev-hint { font-size: 11px; color: var(--muted); }
+  .rev-out { width: 100%; }
+  .rev-title { font-size: 11.5px; color: var(--muted); margin: 10px 0 6px; }
+  .rev-diff {
+    font-size: 13px; line-height: 2; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; overflow-wrap: anywhere;
+  }
+  .rev-diff del, .rev-issue del {
+    color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent);
+    text-decoration: line-through; border-radius: 3px; padding: 0 3px;
+  }
+  .rev-diff ins, .rev-issue ins {
+    color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent);
+    text-decoration: none; font-weight: 600; border-radius: 3px; padding: 0 3px;
+  }
+  .rev-clean {
+    margin-top: 10px; font-size: 13px; line-height: 1.9; color: var(--text);
+    border: 1px solid var(--good); border-radius: 8px; padding: 12px 14px;
+    background: color-mix(in srgb, var(--good) 6%, transparent);
+  }
+  .rev-issues { margin-top: 10px; font-size: 12px; color: var(--text); display: grid; gap: 6px; }
+  .rev-issue { line-height: 1.7; }
+  .rev-issue small { color: var(--muted); }
+  .rev-kind {
+    font-size: 10.5px; color: var(--accent); background: var(--accent-dim);
+    border-radius: 4px; padding: 1px 6px; margin-right: 4px;
+  }
+  .rev-logic { margin-top: 10px; font-size: 12px; color: var(--text); }
+  .rev-logic ul { margin: 6px 0 0; padding-left: 18px; }
+  .rev-logic li { line-height: 1.7; margin-bottom: 4px; color: var(--muted); }
+
+  /* ── AI 첨삭 설정 ─────────────────── */
+  .ai-setup { margin-top: 26px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; background: var(--panel); }
+  .ai-setup summary { font-size: 13px; cursor: pointer; user-select: none; }
+  .ai-setup summary:hover { color: var(--accent); }
+  .ai-body { margin-top: 10px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .ai-body a { color: var(--accent); }
+  .ai-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  .ai-row input {
+    flex: 1; min-width: 200px; font-family: var(--mono); font-size: 12px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    background: var(--panel-2); color: var(--text);
+  }
+  .ai-msg { font-size: 11.5px; color: var(--good); }
+
   .trend-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .trend-title { font-size: 13px; }
   .trend-title small { color: var(--muted); font-size: 11px; }
@@ -534,6 +582,231 @@ const STUDY_PLANS = {
 function buildStudyPlan(avgScores) {
   return Object.entries(avgScores).sort((a, b) => a[1] - b[1]).slice(0, 3)
     .filter(([, v]) => v < 75).map(([k]) => STUDY_PLANS[k]).filter(Boolean);
+}
+
+/* ══════════════ AL 첨삭기 (규칙 기반, 무료) ══════════════
+   전사를 AL 수준 답변으로 고쳐 쓰고, 무엇을 왜 고쳤는지 기록한다 */
+
+// 한국인 학습자 단골 문법 오류 교정 규칙
+const PAST_TO_BASE = { went:"go", saw:"see", ate:"eat", had:"have", got:"get", took:"take", made:"make", came:"come", bought:"buy", felt:"feel", met:"meet", thought:"think", did:"do", gave:"give", found:"find", told:"tell", said:"say", knew:"know", spent:"spend", lost:"lose" };
+const ING_MAP = { watch:"watching", play:"playing", go:"going", read:"reading", listen:"listening", travel:"traveling", cook:"cooking", swim:"swimming", shop:"shopping", run:"running" };
+const PLURAL_MAP = { friend:"friends", hobby:"hobbies", reason:"reasons", place:"places", memory:"memories", movie:"movies", thing:"things", time:"times", country:"countries", city:"cities" };
+const PRESENT_TO_PAST = { go:"went", goes:"went", is:"was", are:"were", am:"was", see:"saw", sees:"saw", eat:"ate", eats:"ate", come:"came", comes:"came", take:"took", takes:"took", get:"got", gets:"got", have:"had", has:"had", make:"made", makes:"made", do:"did", does:"did", feel:"felt", feels:"felt", meet:"met", meets:"met", buy:"bought", buys:"bought", think:"thought", thinks:"thought", watch:"watched", watches:"watched", visit:"visited", visits:"visited", enjoy:"enjoyed", enjoys:"enjoyed", play:"played", plays:"played", stay:"stayed", stays:"stayed", walk:"walked", walks:"walked", talk:"talked", talks:"talked", want:"wanted", wants:"wanted", decide:"decided", decides:"decided", arrive:"arrived", arrives:"arrived", love:"loved", loves:"loved", spend:"spent", spends:"spent", drink:"drank", drinks:"drank" };
+const HABIT_MARKERS = /\b(usually|always|often|sometimes|every|nowadays|these days|still)\s+(\w+\s+)?$/i;
+
+const GRAMMAR_RULES = [
+  { re: /\bi am agree\b/gi, to: () => "I agree", note: "agree는 동사라서 be동사(am)와 함께 쓰지 않아요" },
+  { re: /\b(he|she|it) don't\b/gi, to: m => m.replace(/don't/i, "doesn't"), note: "3인칭 단수 주어에는 doesn't" },
+  { re: /\bdidn't (went|saw|ate|had|got|took|made|came|bought|felt|met|thought|did|gave|found|told|said|knew|spent|lost)\b/gi, to: m => "didn't " + PAST_TO_BASE[m.split(/\s+/)[1].toLowerCase()], note: "didn't 뒤에는 동사원형" },
+  { re: /\bvery (like|love|enjoy|want|recommend)\b/gi, to: m => m.replace(/very/i, "really"), note: "동사는 very가 아니라 really로 강조" },
+  { re: /\bgo(es|ing)? to (shopping|swimming|hiking|fishing|camping|jogging)\b/gi, to: m => m.replace(/ to /i, " "), note: "go shopping/swimming처럼 to 없이 씁니다" },
+  { re: /\balmost (people|everyone|students|koreans|customers)\b/gi, to: m => m.replace(/almost/i, "most"), note: "'대부분의 사람'은 almost가 아니라 most people" },
+  { re: /\ba (hour|honest|umbrella|apple|orange|interesting|amazing|old|awesome|exciting|important)\b/gi, to: m => m.replace(/^a /i, "an "), note: "모음 발음 앞에는 an" },
+  { re: /\bone of (my|the|his|her|our) (friend|hobby|reason|place|memory|movie|thing|time|country|city)\b/gi, to: m => { const w = m.split(/\s+/); return `one of ${w[2]} ${PLURAL_MAP[w[3].toLowerCase()]}`; }, note: "one of 뒤에는 복수 명사" },
+  { re: /\bmany (time|thing|place|reason|movie|friend)\b/gi, to: m => { const w = m.split(/\s+/); return `many ${PLURAL_MAP[w[1].toLowerCase()]}`; }, note: "many 뒤에는 복수 명사" },
+  { re: /\b(go|goes|went|practice|practices|practiced|study|studies|studied|exercise|exercises|exercised) everyday\b/gi, to: m => m.replace(/everyday/i, "every day"), note: "부사로 쓸 때는 every day (everyday는 형용사)" },
+  { re: /\b(in|on|at) (last|next) (year|week|month|weekend)\b/gi, to: m => m.split(/\s+/).slice(1).join(" "), note: "last/next 앞에는 전치사를 쓰지 않아요" },
+  { re: /\bdiscuss(ed|ing)? about\b/gi, to: m => m.replace(/ about/i, ""), note: "discuss는 전치사 없이 바로 목적어" },
+  { re: /\bmarried with\b/gi, to: () => "married to", note: "married to가 맞는 표현" },
+  { re: /\blisten(ed|ing|s)? (music|radio|songs|kpop)\b/gi, to: m => { const w = m.split(/\s+/); return `${w[0]} to ${w[1]}`; }, note: "listen to + 명사" },
+  { re: /\benjoy(ed|s)? to (watch|play|go|read|listen|travel|cook|swim|shop|run)\b/gi, to: m => { const w = m.split(/\s+/); return `${w[0]} ${ING_MAP[w[2].toLowerCase()]}`; }, note: "enjoy 뒤에는 동명사(-ing)" },
+  { re: /\bmore (better|easier|bigger|worse|happier|cheaper|faster|older|younger)\b/gi, to: m => m.split(/\s+/)[1], note: "비교급에는 more를 겹쳐 쓰지 않아요" },
+  { re: /\bi and my (friend|family|sister|brother|wife|husband|girlfriend|boyfriend|coworker)\b/gi, to: m => "my " + m.split(/\s+/)[3] + " and I", note: "영어에서는 상대를 먼저: my friend and I" },
+  { re: /\bfunny\b(?= (trip|time|day|experience|memory))/gi, to: () => "fun", note: "즐거운 경험은 fun (funny는 '웃긴')" },
+  { re: /\b(like|love|liked|loved|likes|loves) (watch|play|read|listen|travel|cook|swim|shop|run)\b/gi, to: m => { const w = m.split(/\s+/); return `${w[0]} ${ING_MAP[w[1].toLowerCase()]}`; }, note: "like/love 뒤에는 동명사(-ing)" },
+];
+
+// very + 평범한 형용사 → 한 단계 높은 어휘
+const VOCAB_UPGRADES = [
+  [/\bvery good\b/gi, "fantastic"], [/\bvery nice\b/gi, "wonderful"],
+  [/\bvery fun\b/gi, "really enjoyable"], [/\bvery big\b/gi, "huge"],
+  [/\bvery small\b/gi, "tiny"], [/\bvery tired\b/gi, "exhausted"],
+  [/\bvery happy\b/gi, "thrilled"], [/\bvery delicious\b/gi, "absolutely delicious"],
+  [/\bvery beautiful\b/gi, "breathtaking"], [/\bvery interesting\b/gi, "fascinating"],
+];
+
+const OPENERS = {
+  experience: "Oh, that reminds me of a really memorable experience.",
+  description: "When it comes to this topic, the first thing that comes to mind is this.",
+  habit: "Let me walk you through what I usually do.",
+  comparison: "Looking back, a lot of things have changed over the years.",
+  issue: "That's an interesting question, and I have a clear opinion about it.",
+  "roleplay-ask": "Hi, thanks for taking my call — I have a few questions.",
+  "roleplay-solve": "Hi, I'm really sorry but there's a problem I need to explain.",
+};
+
+function upgradeToAL(transcript, question) {
+  let text = " " + transcript.replace(/\s+/g, " ").trim() + " ";
+  const issues = [];
+
+  // 1) 문법 교정
+  for (const rule of GRAMMAR_RULES) {
+    text = text.replace(rule.re, m => {
+      const fixed = rule.to(m);
+      if (fixed !== m) issues.push({ kind: "문법", from: m.trim(), to: fixed.trim(), note: rule.note });
+      return fixed;
+    });
+  }
+
+  // 2) 시제 교정: 과거 경험 답변인데 현재형 동사가 나오면 과거형으로
+  if (question && (question.type === "experience" || question.tense === "past")) {
+    const tokens = text.split(/(\s+)/);
+    for (let i = 0; i < tokens.length; i++) {
+      const w = tokens[i].toLowerCase();
+      if (PRESENT_TO_PAST[w]) {
+        const before = tokens.slice(Math.max(0, i - 6), i).join("");
+        if (!HABIT_MARKERS.test(before + " ")) {
+          issues.push({ kind: "시제", from: tokens[i], to: PRESENT_TO_PAST[w], note: "과거 경험은 과거시제로 말해야 감점이 없어요" });
+          tokens[i] = PRESENT_TO_PAST[w];
+        }
+      }
+    }
+    text = tokens.join("");
+  }
+
+  // 3) 어휘 업그레이드
+  for (const [re, to] of VOCAB_UPGRADES) {
+    text = text.replace(re, m => {
+      issues.push({ kind: "어휘", from: m.trim(), to, note: "한 단계 높은 어휘로 인상을 남기세요" });
+      return to;
+    });
+  }
+
+  // 4) 문장 분리 (전사에 마침표가 없을 때를 대비)
+  let sents = text.trim().split(/(?<=[.!?])\s+/).filter(s => s.trim());
+  if (sents.length <= 1 && text.trim().split(/\s+/).length > 25) {
+    const words = text.trim().split(/\s+/);
+    sents = [];
+    let cur = [];
+    for (let i = 0; i < words.length; i++) {
+      cur.push(words[i]);
+      const next = (words[i + 1] || "").toLowerCase();
+      const after = (words[i + 2] || "").toLowerCase();
+      // "my friend and I"처럼 주어 묶음 중간의 and에서는 문장을 끊지 않는다
+      const isSubjectPair = next === "and" && ["i", "we", "my"].includes(after);
+      if (cur.length >= 8 && !isSubjectPair &&
+          ["and", "but", "so", "then", "because", "however", "also"].includes(next) &&
+          words.length - i > 5) {
+        sents.push(cur.join(" ")); cur = [];
+      }
+    }
+    if (cur.length) sents.push(cur.join(" "));
+  }
+  sents = sents.map(s => s.trim().replace(/[.!?]+$/, ""));
+
+  // 5) 구조 보강: 도입 → 연결어 → 마무리
+  const lowerAll = text.toLowerCase();
+  const hasOpener = /^(oh|well|when it comes|let me|that's|looking back|hi)\b/i.test(sents[0] || "");
+  if (!hasOpener && OPENERS[question?.type]) {
+    sents.unshift(OPENERS[question.type].replace(/\.$/, ""));
+    issues.push({ kind: "구조", from: "(도입 없음)", to: OPENERS[question.type], note: "첫 문장에서 자연스럽게 말문을 여는 도입이 AL 답변의 시작이에요" });
+  }
+  const CONN_START = /^(first of all|on top of that|however|as a result|overall|in the end|for example|after that|then|also|besides|moreover|actually|unfortunately|fortunately|at first|suddenly|looking back)\b/i;
+  if (sents.length >= 3 && !CONN_START.test(sents[1])) {
+    sents[1] = "First of all, " + sents[1].charAt(0).toLowerCase() + sents[1].slice(1);
+    issues.push({ kind: "구조", from: "(연결어 없음)", to: "First of all, …", note: "본론 첫 문장은 연결어로 시작해 이야기 뼈대를 세우세요" });
+  }
+  const midIdx = Math.floor(sents.length / 2);
+  if (sents.length >= 5 && !CONN_START.test(sents[midIdx])) {
+    sents[midIdx] = "On top of that, " + sents[midIdx].charAt(0).toLowerCase() + sents[midIdx].slice(1);
+    issues.push({ kind: "구조", from: "(연결어 없음)", to: "On top of that, …", note: "중간에도 연결어를 넣어 문단 감각을 보여주세요" });
+  }
+  if (!/(overall|in the end|that's why|to sum up|long story short)/i.test(lowerAll) && sents.length >= 2) {
+    sents.push("Overall, it was a truly meaningful experience that I still remember vividly");
+    issues.push({ kind: "구조", from: "(마무리 없음)", to: "Overall, …", note: "감정·의미를 담은 마무리 문장이 답변을 '완결된 이야기'로 만들어요" });
+  }
+
+  // 6) 문장 정리: 첫 글자 대문자, 홀로 있는 i 대문자
+  const corrected = sents
+    .map(s => s.replace(/\bi\b/g, "I").replace(/^\s*([a-z])/, (m, c) => c.toUpperCase()))
+    .join(". ") + ".";
+
+  return { corrected, issues };
+}
+
+// 내용 논리 점검 (규칙 기반 한계 안에서)
+function buildLogicNotes(transcript, question) {
+  const notes = [];
+  const lower = transcript.toLowerCase();
+  const qWords = (question.text.toLowerCase().match(/[a-z]{4,}/g) || [])
+    .filter(w => !STOPWORDS.has(w) && !["tell", "about", "please", "describe", "everything", "detail", "indicated", "survey", "usually"].includes(w));
+  const overlap = [...new Set(qWords)].filter(w => lower.includes(w));
+  if (overlap.length < 2 && transcript.split(/\s+/).length > 20)
+    notes.push(`질문의 핵심 단어(${[...new Set(qWords)].slice(0, 4).join(", ")})가 답변에 거의 등장하지 않아요 — 동문서답으로 들릴 수 있으니 질문 키워드를 직접 언급하세요.`);
+  if (!/(for example|for instance|once|one day|last (year|week|month|summer|winter)|when i was)/i.test(lower))
+    notes.push("구체적인 예시나 일화가 없어요. AL 답변은 반드시 '실제 있었던 한 장면'을 담습니다 — 지어내도 괜찮아요.");
+  if (!/(because|since|so that|that's why|the reason)/i.test(lower))
+    notes.push("이유를 설명하는 표현(because, that's why)이 없어요 — 주장마다 이유 한 개씩을 붙이는 습관을 들이세요.");
+  const segs = transcript.toLowerCase().split(/[.!?]+/).map(s => s.trim()).filter(s => s.length > 15);
+  const dup = segs.filter((s, i) => segs.indexOf(s) !== i);
+  if (dup.length) notes.push("같은 문장을 반복하고 있어요 — 반복 대신 부연(In other words, …)으로 바꾸면 어휘 점수도 올라갑니다.");
+  return notes;
+}
+
+// 단어 단위 diff (LCS) → 수정 전/후 하이라이트 HTML
+function diffWords(a, b) {
+  const A = a.split(/\s+/).filter(Boolean), B = b.split(/\s+/).filter(Boolean);
+  const norm = w => w.toLowerCase().replace(/[.,!?]+$/, "");
+  const n = A.length, m = B.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = norm(A[i]) === norm(B[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (norm(A[i]) === norm(B[j])) { out.push(esc(B[j])); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(`<del>${esc(A[i])}</del>`); i++; }
+    else { out.push(`<ins>${esc(B[j])}</ins>`); j++; }
+  }
+  while (i < n) { out.push(`<del>${esc(A[i])}</del>`); i++; }
+  while (j < m) { out.push(`<ins>${esc(B[j])}</ins>`); j++; }
+  return out.join(" ");
+}
+
+// 첨삭 결과 렌더링: diff → AL 버전 → 고친 이유 → 논리 점검
+function revisionHTML(orig, corrected, issues, logicNotes, title) {
+  return `
+    <div class="rev-title">${esc(title)}</div>
+    <div class="rev-diff">${diffWords(orig, corrected)}</div>
+    <div class="rev-clean"><b>✅ AL 버전 — 소리 내어 3번 읽으며 연습하세요</b><br>${esc(corrected)}</div>
+    ${issues.length ? `<div class="rev-issues"><b>고친 이유</b>${issues.slice(0, 14).map(it =>
+      `<div class="rev-issue"><span class="rev-kind">${esc(it.kind || "수정")}</span> <del>${esc(it.from)}</del> → <ins>${esc(it.to)}</ins><small> · ${esc(it.note)}</small></div>`).join("")}</div>` : ""}
+    ${logicNotes.length ? `<div class="rev-logic"><b>내용·논리 점검</b><ul>${logicNotes.map(n => `<li>${esc(n)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+/* ══════════════ AI 정밀 첨삭 (선택 — 본인 무료 API 키) ══════════════ */
+function getAiKey() { try { return localStorage.getItem("opic_gemini_key") || ""; } catch { return ""; } }
+
+async function aiReview(transcript, question) {
+  const key = getAiKey();
+  const prompt = `You are a strict OPIc rater targeting the AL (Advanced Low) level.
+The student answered this OPIc question (speech-to-text transcript, punctuation may be missing):
+
+QUESTION: ${question.text}
+ANSWER TRANSCRIPT: ${transcript}
+
+Return ONLY valid JSON (no markdown fence) with this exact shape:
+{
+ "corrected": "<the full answer rewritten at AL level: fix ALL grammar errors, fix tense, improve logic/flow, keep the student's original ideas and length similar>",
+ "grammar": [{"from":"<original phrase>","to":"<fixed phrase>","why":"<한국어로 이유 한 문장>"}],
+ "logic": ["<내용·논리 문제점과 개선 방법을 한국어로, 최대 3개>"],
+ "tips": ["<이 답변을 AL로 올리기 위한 핵심 조언을 한국어로, 최대 2개>"]
+}`;
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } }) }
+  );
+  if (!res.ok) {
+    if (res.status === 400 || res.status === 403) throw new Error("API 키가 올바르지 않아요. 키를 다시 확인해 주세요.");
+    if (res.status === 429) throw new Error("무료 사용량을 잠시 초과했어요. 1분 후 다시 시도해 주세요.");
+    throw new Error(`요청 실패 (HTTP ${res.status})`);
+  }
+  const data = await res.json();
+  let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  raw = raw.replace(/^```(json)?/m, "").replace(/```\s*$/m, "").trim();
+  return JSON.parse(raw);
 }
 
 /* ══════════════ 저장소 (localStorage) ══════════════ */
@@ -890,7 +1163,26 @@ function renderHome() {
       ${trendChartHTML(recent)}
       ${weakNote}
     </div>
-    <div class="foot">모든 처리(음성인식·합성·분석·기록)는 브라우저 안에서 무료로 이뤄집니다 — 서버·유료 API 호출 없음.
+    <details class="ai-setup">
+      <summary>🤖 AI 정밀 첨삭 설정 (선택 · 무료)</summary>
+      <div class="ai-body">
+        <p>기본 첨삭은 규칙 기반이라 자주 나오는 오류 위주로만 잡습니다. 문법 정확성과 내용 논리까지
+        제대로 검토받으려면 Google AI Studio에서 <b>무료 API 키</b>(결제정보 등록 불필요)를 만들어 등록하세요.
+        등록하면 결과 화면에 "AI 정밀 첨삭" 버튼이 생깁니다.</p>
+        <p>발급 방법: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>
+        접속 → Google 로그인 → "Create API key" (약 1분). 무료 한도로 하루 수백 회 첨삭이 가능합니다.</p>
+        <p>키는 이 기기 브라우저에만 저장되며, AI 첨삭을 누를 때 해당 답변 텍스트가 Google로 전송됩니다.</p>
+        <div class="ai-row">
+          <input id="ai-key" type="password" placeholder="AIza… 형식의 API 키 붙여넣기" autocomplete="off">
+          <button class="btn small" id="ai-save">저장</button>
+          <button class="btn ghost small" id="ai-del">삭제</button>
+          <span id="ai-msg" class="ai-msg"></span>
+        </div>
+      </div>
+    </details>
+
+    <div class="foot">기본 기능(음성인식·합성·분석·첨삭·기록)은 모두 브라우저 안에서 무료로 이뤄집니다 — 서버·유료 API 호출 없음.
+      AI 정밀 첨삭은 선택 기능으로, 본인이 발급한 무료 키로 동작합니다.
       음성인식은 Chrome 내장 Web Speech API를 사용하며, 기록은 이 기기의 브라우저에만 저장됩니다.
       점수와 등급은 학습용 추정치로, 실제 OPIc 공식 채점과 다를 수 있습니다.
       마이크가 차단된 환경(일부 패널·인앱 브라우저)에서는 새 탭으로 열거나 텍스트 입력으로 연습하세요.</div>`;
@@ -905,6 +1197,18 @@ function renderHome() {
   });
   const tt = el("tbl-toggle");
   if (tt) tt.onclick = () => { S.trendTable = !S.trendTable; render(); };
+  el("ai-key").value = getAiKey();
+  el("ai-save").onclick = () => {
+    const v = el("ai-key").value.trim();
+    if (!v) { el("ai-msg").textContent = "키를 입력해 주세요"; return; }
+    try { localStorage.setItem("opic_gemini_key", v); } catch {}
+    el("ai-msg").textContent = "저장됨 ✓ 이제 결과 화면에서 AI 정밀 첨삭을 쓸 수 있어요";
+  };
+  el("ai-del").onclick = () => {
+    try { localStorage.removeItem("opic_gemini_key"); } catch {}
+    el("ai-key").value = "";
+    el("ai-msg").textContent = "삭제됨";
+  };
   bindTrendHover(recent);
 }
 
@@ -1010,6 +1314,13 @@ function renderResult() {
         <div class="transcript"><b>전사:</b> ${esc(a.transcript)}</div>
         ${m.connectivesFound.length ? `<div class="used-good">✓ 사용한 연결 표현: ${m.connectivesFound.join(", ")}</div>` : ""}
         <div class="fb-list">${fb}</div>
+        <div class="rev-zone">
+          <button class="btn ghost small" data-rev="${i}">✍️ AL 첨삭 — 수정 전/후 보기</button>
+          ${getAiKey()
+            ? `<button class="btn ghost small" data-airev="${i}">🤖 AI 정밀 첨삭 (문법·논리)</button>`
+            : `<span class="rev-hint">문법·논리까지 잡는 AI 정밀 첨삭은 홈 하단에서 무료 키 등록 후 사용 가능</span>`}
+          <div class="rev-out" id="rev-${i}"></div>
+        </div>
       </div></div>`;
   }).join("");
 
@@ -1033,6 +1344,33 @@ function renderResult() {
 
   el("home").onclick = () => { S.screen = "home"; render(); };
   el("retry").onclick = () => startExam(S.questions);
+  document.querySelectorAll("[data-rev]").forEach(b => {
+    b.onclick = () => {
+      const i = +b.dataset.rev, a = S.answers[i], out = el("rev-" + i);
+      if (out.dataset.mode === "rule") { out.innerHTML = ""; out.dataset.mode = ""; return; }
+      const { corrected, issues } = upgradeToAL(a.transcript, a.q);
+      const logic = buildLogicNotes(a.transcript, a.q);
+      out.innerHTML = revisionHTML(a.transcript, corrected, issues, logic,
+        "기본 첨삭 (규칙 기반) — 자주 나오는 오류·구조 중심이며, 모든 문법을 잡지는 못해요");
+      out.dataset.mode = "rule";
+    };
+  });
+  document.querySelectorAll("[data-airev]").forEach(b => {
+    b.onclick = async () => {
+      const i = +b.dataset.airev, a = S.answers[i], out = el("rev-" + i);
+      b.disabled = true; b.textContent = "🤖 AI 분석 중…";
+      try {
+        const r = await aiReview(a.transcript, a.q);
+        const issues = (r.grammar || []).map(g => ({ kind: "문법", from: g.from, to: g.to, note: g.why }));
+        out.innerHTML = revisionHTML(a.transcript, r.corrected || a.transcript, issues,
+          [...(r.logic || []), ...(r.tips || [])], "AI 정밀 첨삭 — 문법·내용 논리까지 검토한 결과");
+        out.dataset.mode = "ai";
+      } catch (e) {
+        out.innerHTML = `<p class="mic-err">⚠ ${esc(e.message)}</p>`;
+      }
+      b.disabled = false; b.textContent = "🤖 AI 정밀 첨삭 (문법·논리)";
+    };
+  });
   document.querySelectorAll("[data-toggle]").forEach(b => {
     b.onclick = () => {
       const i = b.dataset.toggle;
