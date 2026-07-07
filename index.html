@@ -844,7 +844,7 @@ function calcStreak(sessions) {
 }
 
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
-const APP_VER = "v6";
+const APP_VER = "v7";
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
@@ -900,6 +900,19 @@ if ("speechSynthesis" in window) { speechSynthesis.getVoices(); speechSynthesis.
    데스크톱: 녹음 + 음성인식 동시 (마이크 공유 가능)
    모바일: 마이크가 독점이라 동시에 켜면 둘 다 실패 → 음성인식(전사)만 사용 */
 
+// 누적본 병합: 새 조각이 기존 조각을 포함하거나(더 긴 버전) 기존에 이미 포함되어
+// 있으면(부분본) 둘 중 긴 쪽 하나만 남긴다 — 안드로이드가 같은 발화를
+// "I like" → "I like watching" → "I like watching movies"처럼 겹쳐 보내는 패턴 대응
+function mergeSegment(list, t) {
+  const tn = t.toLowerCase();
+  for (let i = list.length - 1; i >= 0; i--) {
+    const ln = list[i].toLowerCase();
+    if (ln === tn || ln.includes(tn)) return;          // 이미 있는 조각의 부분본 → 버림
+    if (tn.includes(ln)) { list.splice(i, 1); }         // 기존 조각의 확장본 → 기존 것 제거
+  }
+  list.push(t);
+}
+
 // 인식 세션 하나를 새 인스턴스로 시작 — 같은 인스턴스를 재시작하면
 // 일부 기기에서 이전 결과를 다시 재생(replay)해 전사가 반복되는 문제가 있다
 function startRecognizer() {
@@ -908,28 +921,37 @@ function startRecognizer() {
   r.onresult = e => {
     clearTimeout(R.watchdog);
     // 이어붙이지 않고 이번 세션의 확정 조각 전체를 매번 처음부터 다시 조립:
-    // (1) 연속 중복 조각 제거 (2) 이전 세션 문장을 다시 보내는 에코 제거
+    // (1) 누적본 병합 — "I like" → "I like watching"처럼 겹치는 조각은 긴 쪽만 유지
+    // (2) 이전 세션 문장을 다시 보내는 에코 제거
+    // (3) 임시(interim) 결과는 마지막 것 하나만 표시 (누적본을 이어붙이면 반복처럼 보임)
     const baseNorm = R.baseSegs.map(s => s.toLowerCase());
     const segs = [];
-    let interim = "", prev = null;
+    let interim = "";
     for (let i = 0; i < e.results.length; i++) {
       const t = (e.results[i][0].transcript || "").trim();
       if (!t) continue;
       if (e.results[i].isFinal) {
         const tn = t.toLowerCase();
-        const isEcho = t.split(/\s+/).length >= 3 && baseNorm.includes(tn);
-        if (tn !== prev && !isEcho) segs.push(t);
-        prev = tn;
-      } else interim += t + " ";
+        if (t.split(/\s+/).length >= 3 && baseNorm.includes(tn)) continue; // 에코
+        mergeSegment(segs, t);
+      } else interim = t; // 마지막 임시 결과만
     }
+    R.lastInterim = interim;
     R.sessionSegs = segs;
     R.final = dedupeRepeats([...R.baseSegs, ...segs].join(" "));
     const box = el("live-box");
     if (box) box.textContent = dedupeRepeats((R.final + " " + interim).trim()) || "말씀하시면 여기에 영어 전사가 표시됩니다…";
   };
   r.onend = () => {
-    // 인식 세션이 끝나면(침묵 등) 확정 조각을 base로 옮기고 "새 인스턴스"로 재시작
-    if (R.sessionSegs.length) { R.baseSegs.push(...R.sessionSegs); R.sessionSegs = []; }
+    // 인식 세션이 끝나면(침묵 등) 확정 조각을 base로 병합하고 "새 인스턴스"로 재시작
+    if (R.sessionSegs.length) {
+      for (const s of R.sessionSegs) mergeSegment(R.baseSegs, s);
+      R.sessionSegs = [];
+    } else if (R.lastInterim && R.lastInterim.split(/\s+/).length >= 2) {
+      // 확정 결과를 끝내 안 주는 기기: 마지막 임시 결과라도 살린다
+      mergeSegment(R.baseSegs, R.lastInterim);
+    }
+    R.lastInterim = "";
     R.final = dedupeRepeats(R.baseSegs.join(" "));
     if (R.keepAlive) { try { startRecognizer(); } catch {} }
   };
@@ -946,7 +968,7 @@ function startRecognizer() {
 }
 async function startRecording() {
   S.micError = ""; S.emptyWarn = false;
-  R.final = ""; R.baseSegs = []; R.sessionSegs = []; R.chunks = []; R.media = null;
+  R.final = ""; R.baseSegs = []; R.sessionSegs = []; R.lastInterim = ""; R.chunks = []; R.media = null;
   if ("speechSynthesis" in window) speechSynthesis.cancel();
 
   const useRecorder = !(IS_MOBILE && SR_CLASS && !S.srDead);
@@ -1018,12 +1040,22 @@ function enterQuestion() {
   render();
   setTimeout(() => speak(S.questions[S.qIdx].text), 400);
 }
+// 지금까지 인식된 전체 텍스트를 조각 병합 + 반복 제거를 거쳐 계산
+// (onend가 아직 안 온 마지막 세션의 조각과 임시 결과까지 포함)
+function currentTranscript() {
+  const segs = [...R.baseSegs];
+  for (const s of R.sessionSegs) mergeSegment(segs, s);
+  if (R.lastInterim && R.lastInterim.split(/\s+/).length >= 2) mergeSegment(segs, R.lastInterim);
+  return { text: dedupeRepeats(segs.join(" ")).trim(), segs };
+}
+
 async function submitAnswer() {
+  const cur = currentTranscript();
   const { dur, audioUrl } = await stopRecording();
   const q = S.questions[S.qIdx];
   const manual = el("manual-text");
   const typed = (manual ? manual.value : "").trim();
-  const transcript = dedupeRepeats((R.final || typed).trim());
+  const transcript = cur.text || typed;
   if (!transcript) {
     // 전사가 비었으면 그냥 넘기지 않고, 녹음은 보존한 채 직접 입력 기회를 준다
     R.pendingAudio = audioUrl; R.pendingDur = dur;
@@ -1031,7 +1063,8 @@ async function submitAnswer() {
     render();
     return;
   }
-  advance({ q, transcript, dur, audioUrl, result: analyzeAnswer({ transcript, durationSec: dur, question: q }) });
+  advance({ q, transcript, dur, audioUrl, rawSegs: cur.segs,
+    result: analyzeAnswer({ transcript, durationSec: dur, question: q }) });
 }
 function submitManualOnly() {
   const q = S.questions[S.qIdx];
@@ -1342,6 +1375,7 @@ function renderResult() {
           <span>🔗 연결어 ${m.distinctConnectives}종</span><span>🧩 복문 ${m.subCount}회</span><span>😶 필러 ${m.fillerTotal}회</span></div>
         ${a.audioUrl ? `<audio controls src="${a.audioUrl}" class="ans-audio"></audio>` : ""}
         <div class="transcript"><b>전사:</b> ${esc(a.transcript)}</div>
+        ${a.rawSegs && a.rawSegs.length ? `<details class="manual-details"><summary>🔧 원본 인식 조각 ${a.rawSegs.length}개 — 전사가 이상할 때 이 내용을 복사해서 알려주세요</summary><div class="transcript">${a.rawSegs.map(s => esc(s)).join(" ⏐ ")}</div></details>` : ""}
         ${m.connectivesFound.length ? `<div class="used-good">✓ 사용한 연결 표현: ${m.connectivesFound.join(", ")}</div>` : ""}
         <div class="fb-list">${fb}</div>
         <div class="rev-zone">
