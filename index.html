@@ -195,8 +195,19 @@
     margin-top: 14px; border: 1px dashed var(--border); border-radius: 8px;
     background: var(--panel-2); padding: 12px 14px; font-size: 13px; line-height: 1.7; min-height: 52px;
   }
-  .mic-err { color: var(--bad); font-size: 12.5px; margin: 8px 0; }
-  .manual-box { margin-top: 16px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .mic-err { color: var(--bad); font-size: 12.5px; margin: 8px 0; line-height: 1.6; }
+  .q-text {
+    font-size: 13.5px; line-height: 1.8; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; margin-bottom: 16px;
+  }
+  .manual-details { margin-top: 16px; }
+  .manual-details summary {
+    font-size: 12px; color: var(--muted); cursor: pointer;
+    padding: 6px 0; user-select: none;
+  }
+  .manual-details summary:hover { color: var(--accent); }
+  .manual-box { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.6; }
   .manual-box textarea {
     width: 100%; margin-top: 8px; font-family: var(--mono); font-size: 13px;
     border: 1px solid var(--border); border-radius: 8px; padding: 10px;
@@ -541,21 +552,34 @@ function calcStreak(sessions) {
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+// 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
+const IS_SAMSUNG = /SamsungBrowser/i.test(navigator.userAgent);
+// 모바일에서는 마이크가 독점이라 녹음(MediaRecorder)과 음성인식을 동시에 못 쓴다
+// → 모바일은 음성인식(전사) 우선, 답변 녹음/다시듣기는 데스크톱에서만
+const IS_MOBILE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 const S = {
   screen: "home", questions: [], qIdx: 0, answers: [],
   recording: false, replaysLeft: 1,
   // 실시간 전사는 기본 켜짐 — 사용자가 끄면 그 선택을 기억한다
   showLive: (() => { try { return localStorage.getItem("opic_show_live") !== "off"; } catch { return true; } })(),
   micError: "", trendTable: false,
+  srDead: false,      // 음성인식이 런타임에 실패한 것으로 감지됨
+  showText: false,    // 질문 영어 텍스트 표시 (TTS가 안 들릴 때 자동 켜짐)
+  emptyWarn: false,   // 답변 완료 시 전사가 비어 있었음
 };
-const R = { recog: null, media: null, chunks: [], final: "", start: 0, timer: null, keepAlive: false };
+const R = { recog: null, media: null, chunks: [], final: "", start: 0, timer: null,
+  keepAlive: false, watchdog: null, pendingAudio: null, pendingDur: 0 };
 
 function esc(t) { return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
 function el(id) { return document.getElementById(id); }
 
 /* ── TTS ── */
 function speak(text) {
-  if (!("speechSynthesis" in window)) return;
+  // TTS가 없거나 3초 내 재생이 시작되지 않으면 질문 텍스트를 화면에 띄운다
+  if (!("speechSynthesis" in window)) {
+    if (!S.showText && S.screen === "exam") { S.showText = true; render(); }
+    return;
+  }
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.lang = "en-US"; u.rate = 0.92;
@@ -563,31 +587,47 @@ function speak(text) {
   const v = vs.find(v => v.lang === "en-US" && /female|samantha|aria|jenny/i.test(v.name))
     || vs.find(v => v.lang === "en-US") || vs.find(v => v.lang && v.lang.startsWith("en"));
   if (v) u.voice = v;
-  u.onstart = () => { const f = el("eva-face"); if (f) f.classList.add("talking"); };
+  let started = false;
+  u.onstart = () => { started = true; const f = el("eva-face"); if (f) f.classList.add("talking"); };
   u.onend = () => { const f = el("eva-face"); if (f) f.classList.remove("talking"); };
+  u.onerror = () => { if (!S.showText && S.screen === "exam") { S.showText = true; render(); } };
   speechSynthesis.speak(u);
+  setTimeout(() => {
+    if (!started && !S.showText && S.screen === "exam" && !S.recording) { S.showText = true; render(); }
+  }, 3000);
 }
 if ("speechSynthesis" in window) { speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = () => {}; }
 
-/* ── 녹음 + 음성인식 ── */
+/* ── 녹음 + 음성인식 ──
+   데스크톱: 녹음 + 음성인식 동시 (마이크 공유 가능)
+   모바일: 마이크가 독점이라 동시에 켜면 둘 다 실패 → 음성인식(전사)만 사용 */
 async function startRecording() {
-  S.micError = ""; R.final = ""; R.chunks = [];
+  S.micError = ""; S.emptyWarn = false; R.final = ""; R.chunks = []; R.media = null;
   if ("speechSynthesis" in window) speechSynthesis.cancel();
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mr = new MediaRecorder(stream);
-    mr.ondataavailable = e => { if (e.data.size) R.chunks.push(e.data); };
-    mr.start();
-    R.media = mr;
-  } catch {
-    S.micError = "마이크를 사용할 수 없습니다. 사이드 패널에서 마이크가 차단된 경우, 아티팩트를 새 탭으로 열어 시도해 보세요. 지금은 아래에 답변을 텍스트로 입력해도 동일하게 분석됩니다.";
-    render();
-    return;
+
+  const useRecorder = !(IS_MOBILE && SR_CLASS && !S.srDead);
+  if (useRecorder) {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      mr.ondataavailable = e => { if (e.data.size) R.chunks.push(e.data); };
+      mr.start();
+      R.media = mr;
+    } catch {
+      if (!SR_CLASS || S.srDead) {
+        S.micError = "마이크를 사용할 수 없습니다. 브라우저 설정에서 이 사이트의 마이크 권한을 허용해 주세요. 지금은 아래에 답변을 텍스트로 입력해도 동일하게 분석됩니다.";
+        render();
+        return;
+      }
+      // 인식은 가능할 수 있으니 녹음 없이 계속 진행
+    }
   }
-  if (SR_CLASS) {
+
+  if (SR_CLASS && !S.srDead) {
     const r = new SR_CLASS();
     r.lang = "en-US"; r.continuous = true; r.interimResults = true;
     r.onresult = e => {
+      clearTimeout(R.watchdog);
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
@@ -597,11 +637,24 @@ async function startRecording() {
       if (box) box.textContent = (R.final + interim) || "말씀하시면 여기에 영어 전사가 표시됩니다…";
     };
     r.onend = () => { if (R.keepAlive) { try { r.start(); } catch {} } };
-    r.onerror = () => {};
+    // 삼성 인터넷 등: API는 있지만 인식 서비스가 없어 즉시 에러가 난다 → 감지 후 텍스트 입력 안내
+    r.onerror = e => {
+      if (["service-not-allowed", "not-allowed", "language-not-supported", "audio-capture", "network"].includes(e.error)) {
+        R.keepAlive = false;
+        S.srDead = true;
+        if (S.recording) render();
+      }
+    };
     R.keepAlive = true;
-    try { r.start(); } catch {}
+    try { r.start(); } catch { S.srDead = true; }
     R.recog = r;
+    // 12초 동안 인식 결과가 전혀 없으면 미지원 브라우저로 간주하고 대안 안내
+    clearTimeout(R.watchdog);
+    R.watchdog = setTimeout(() => {
+      if (S.recording && !R.final && SR_CLASS && !S.srDead) { S.srDead = true; render(); }
+    }, 12000);
   }
+
   R.start = Date.now();
   R.timer = setInterval(() => {
     const sec = Math.round((Date.now() - R.start) / 1000);
@@ -615,6 +668,7 @@ async function startRecording() {
 function stopRecording() {
   return new Promise(resolve => {
     R.keepAlive = false;
+    clearTimeout(R.watchdog);
     try { if (R.recog) R.recog.stop(); } catch {}
     clearInterval(R.timer);
     const dur = Math.round((Date.now() - R.start) / 1000);
@@ -637,7 +691,8 @@ function startExam(qs) {
   enterQuestion();
 }
 function enterQuestion() {
-  S.replaysLeft = 1; S.micError = ""; R.final = "";
+  S.replaysLeft = 1; S.micError = ""; S.emptyWarn = false;
+  R.final = ""; R.pendingAudio = null; R.pendingDur = 0;
   render();
   setTimeout(() => speak(S.questions[S.qIdx].text), 400);
 }
@@ -645,17 +700,27 @@ async function submitAnswer() {
   const { dur, audioUrl } = await stopRecording();
   const q = S.questions[S.qIdx];
   const manual = el("manual-text");
-  const transcript = (SR_CLASS ? R.final : (manual ? manual.value : "")).trim();
-  const result = transcript ? analyzeAnswer({ transcript, durationSec: dur, question: q }) : null;
-  advance({ q, transcript, dur, audioUrl, result });
+  const typed = (manual ? manual.value : "").trim();
+  const transcript = (R.final || typed).trim();
+  if (!transcript) {
+    // 전사가 비었으면 그냥 넘기지 않고, 녹음은 보존한 채 직접 입력 기회를 준다
+    R.pendingAudio = audioUrl; R.pendingDur = dur;
+    S.emptyWarn = true;
+    render();
+    return;
+  }
+  advance({ q, transcript, dur, audioUrl, result: analyzeAnswer({ transcript, durationSec: dur, question: q }) });
 }
 function submitManualOnly() {
   const q = S.questions[S.qIdx];
   const transcript = (el("manual-text") ? el("manual-text").value : "").trim();
   if (!transcript) return;
   const words = transcript.split(/\s+/).filter(Boolean).length;
-  const dur = Math.max(Math.round(words / 2), 10);
-  advance({ q, transcript, dur, audioUrl: null, result: analyzeAnswer({ transcript, durationSec: dur, question: q }) });
+  // 직전에 녹음한 실제 발화 시간이 있으면 그것을 사용, 없으면 120WPM 기준 추정
+  const dur = R.pendingDur > 3 ? R.pendingDur : Math.max(Math.round(words / 2), 10);
+  const audioUrl = R.pendingAudio;
+  R.pendingAudio = null; R.pendingDur = 0;
+  advance({ q, transcript, dur, audioUrl, result: analyzeAnswer({ transcript, durationSec: dur, question: q }) });
 }
 function skipQuestion() {
   if (S.recording) stopRecording();
@@ -684,6 +749,7 @@ function finishSession() {
 }
 function quitExam() {
   R.keepAlive = false;
+  clearTimeout(R.watchdog);
   try { if (R.recog) R.recog.stop(); } catch {}
   if (R.media && R.media.state === "recording") { R.media.stream.getTracks().forEach(t => t.stop()); R.media.stop(); }
   clearInterval(R.timer);
@@ -778,7 +844,9 @@ function renderHome() {
     <div class="topbar">
       <div class="brand"><span class="dot"></span><span><b>OPIc AL 트레이너</b> <span class="sub">// 매일 실전 연습 · API 비용 0원</span></span></div>
     </div>
-    ${SR_CLASS ? "" : `<div class="warn-banner">⚠ 이 브라우저는 음성인식을 지원하지 않습니다. <b>Chrome(데스크톱/안드로이드)</b>에서 열면 말한 내용이 자동으로 전사·분석됩니다. 지금은 답변을 텍스트로 입력해 연습할 수 있습니다.</div>`}
+    ${!SR_CLASS ? `<div class="warn-banner">⚠ 이 브라우저는 음성인식을 지원하지 않습니다. <b>Chrome(데스크톱/안드로이드)</b>에서 열면 말한 내용이 자동으로 전사·분석됩니다. 지금은 답변을 텍스트로 입력해 연습할 수 있습니다.</div>`
+      : IS_SAMSUNG ? `<div class="warn-banner">⚠ 삼성 인터넷에서는 음성인식(받아쓰기)이 동작하지 않습니다. 이 주소를 <b>Chrome 앱</b>으로 열어주세요 — 주소를 복사해 Chrome에 붙여넣으면 됩니다. 삼성 인터넷에서는 텍스트 입력 모드로 연습할 수 있습니다.</div>`
+      : S.srDead ? `<div class="warn-banner">⚠ 이 브라우저에서 음성인식이 동작하지 않는 것으로 감지됐습니다. <b>Chrome 앱</b>으로 열면 받아쓰기가 됩니다.</div>` : ""}
     <div class="stat-row">
       <div class="stat-tile"><div class="stat-label">연속 학습</div><div class="stat-num">${streak}<small>일</small></div></div>
       <div class="stat-tile"><div class="stat-label">총 세션</div><div class="stat-num">${sessions.length}<small>회</small></div></div>
@@ -834,32 +902,45 @@ function renderExam() {
       <div class="eva"><div class="eva-face" id="eva-face">🎧</div>
         <div class="eva-name">Eva <small>· AI 인터뷰어 (브라우저 TTS)</small></div></div>
       <div class="q-meta"><span class="q-cat">${esc(q.cat || "질문")}</span><span class="q-type">${esc(q.ko)}</span></div>
+      ${S.showText ? `<div class="q-text">${esc(q.text)}</div>` : ""}
       <div class="q-controls">
-        <button class="btn ghost" id="replay" ${S.replaysLeft <= 0 || S.recording ? "disabled" : ""}>🔁 다시 듣기 (${S.replaysLeft}회 남음)</button>
-        <label class="live-toggle"><input type="checkbox" id="live-chk" ${S.showLive ? "checked" : ""}> 실시간 전사 보기 (실전 연습 시 끄기 권장)</label>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn ghost" id="replay" ${S.replaysLeft <= 0 || S.recording ? "disabled" : ""}>🔁 다시 듣기 (${S.replaysLeft}회 남음)</button>
+          <button class="btn ghost" id="show-text">${S.showText ? "질문 텍스트 숨기기" : "📄 질문 텍스트 보기"}</button>
+        </span>
+        <label class="live-toggle"><input type="checkbox" id="live-chk" ${S.showLive ? "checked" : ""}> 실시간 전사 보기</label>
       </div>
       ${S.micError ? `<p class="mic-err">⚠ ${esc(S.micError)}</p>` : ""}
+      ${S.srDead ? `<p class="mic-err">⚠ 이 브라우저에서 음성인식이 동작하지 않습니다${IS_SAMSUNG ? " (삼성 인터넷은 음성인식 미지원)" : ""}. <b>Chrome 앱</b>으로 열면 전사가 됩니다. 지금은 말한 뒤 아래에 직접 입력하면 동일하게 분석됩니다.</p>` : ""}
+      ${S.emptyWarn ? `<p class="mic-err">⚠ 전사된 내용이 없습니다. 마이크가 소리를 못 받았거나 음성인식이 동작하지 않은 것 같아요 — 아래에 답변을 직접 입력해 제출하거나, 건너뛸 수 있습니다.</p>` : ""}
       <div class="rec-zone">
         ${!S.recording
           ? `<button class="btn rec" id="rec-start">● 답변 시작</button>`
-          : `<div class="rec-status"><span class="rec-dot"></span> 녹음 중 — <span id="elapsed"><b>0초</b></span></div>
+          : `<div class="rec-status"><span class="rec-dot"></span> ${IS_MOBILE && SR_CLASS && !S.srDead ? "인식 중" : "녹음 중"} — <span id="elapsed"><b>0초</b></span></div>
              <button class="btn stop" id="rec-stop">■ 답변 완료</button>`}
         <button class="btn ghost small" id="skip">이 문항 건너뛰기 →</button>
       </div>
-      ${S.showLive && S.recording ? `<div class="live-box" id="live-box">말씀하시면 여기에 영어 전사가 표시됩니다…</div>` : ""}
-      ${(!SR_CLASS || S.micError) ? `
+      ${S.showLive && S.recording && SR_CLASS && !S.srDead ? `<div class="live-box" id="live-box">말씀하시면 여기에 영어 전사가 표시됩니다…</div>` : ""}
+      ${(!SR_CLASS || S.srDead || S.micError || S.emptyWarn) ? `
         <div class="manual-box">
-          <p>${!SR_CLASS ? "이 브라우저는 음성인식(Web Speech API)을 지원하지 않습니다. <b>Chrome</b> 사용을 권장합니다. 지금은 답변을 말한 뒤 아래에 직접 입력하면 동일하게 분석됩니다." : "마이크 없이 연습하려면 답변을 영어로 입력한 뒤 제출하세요."}</p>
-          <textarea id="manual-text" rows="4" placeholder="방금 말한 답변을 영어로 입력…"></textarea>
+          <textarea id="manual-text" rows="4" placeholder="답변을 영어로 입력…"></textarea>
           <button class="btn stop" id="manual-submit">텍스트로 제출 →</button>
-        </div>` : ""}
+        </div>` : `
+        <details class="manual-details">
+          <summary>🖊 텍스트로 직접 입력 (전사가 안 될 때)</summary>
+          <div class="manual-box">
+            <textarea id="manual-text" rows="4" placeholder="답변을 영어로 입력…"></textarea>
+            <button class="btn stop" id="manual-submit">텍스트로 제출 →</button>
+          </div>
+        </details>`}
     </div>
-    <p class="exam-tip">실전처럼: 질문을 두 번까지만 듣고, 멈추지 말고 90초 이상 말하세요. 전사가 다소 부정확해도 분석 지표에는 큰 영향이 없습니다.</p>`;
+    <p class="exam-tip">실전처럼: 질문을 두 번까지만 듣고, 멈추지 말고 90초 이상 말하세요. 전사가 다소 부정확해도 분석 지표에는 큰 영향이 없습니다.${IS_MOBILE ? " 모바일에서는 마이크 제약으로 전사만 되고 답변 녹음 파일(다시 듣기)은 제공되지 않습니다." : ""}</p>`;
 
   el("quit").onclick = quitExam;
   el("skip").onclick = skipQuestion;
   const rp = el("replay");
   if (rp) rp.onclick = () => { S.replaysLeft--; rp.disabled = true; rp.textContent = "🔁 다시 듣기 (0회 남음)"; speak(q.text); };
+  el("show-text").onclick = () => { S.showText = !S.showText; render(); };
   el("live-chk").onchange = e => {
     S.showLive = e.target.checked;
     try { localStorage.setItem("opic_show_live", S.showLive ? "on" : "off"); } catch {}
