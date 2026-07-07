@@ -743,6 +743,27 @@ function buildLogicNotes(transcript, question) {
   return notes;
 }
 
+// 반복 블록 제거: 어떤 패턴으로든 같은 구절이 연달아 반복되면 한 번만 남긴다
+// (기기별 음성인식 중복 버그에 대한 최종 방어선 — 3단어 이상 블록만 대상)
+function dedupeRepeats(text) {
+  const tokens = text.split(/\s+/).filter(Boolean);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    outer:
+    for (let L = Math.min(40, Math.floor(tokens.length / 2)); L >= 3; L--) {
+      for (let i = 0; i + 2 * L <= tokens.length; i++) {
+        let same = true;
+        for (let k = 0; k < L; k++) {
+          if (tokens[i + k].toLowerCase() !== tokens[i + L + k].toLowerCase()) { same = false; break; }
+        }
+        if (same) { tokens.splice(i + L, L); changed = true; break outer; }
+      }
+    }
+  }
+  return tokens.join(" ");
+}
+
 // 단어 단위 diff (LCS) → 수정 전/후 하이라이트 HTML
 function diffWords(a, b) {
   const A = a.split(/\s+/).filter(Boolean), B = b.split(/\s+/).filter(Boolean);
@@ -823,6 +844,7 @@ function calcStreak(sessions) {
 }
 
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
+const APP_VER = "v6";
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
@@ -877,6 +899,51 @@ if ("speechSynthesis" in window) { speechSynthesis.getVoices(); speechSynthesis.
 /* ── 녹음 + 음성인식 ──
    데스크톱: 녹음 + 음성인식 동시 (마이크 공유 가능)
    모바일: 마이크가 독점이라 동시에 켜면 둘 다 실패 → 음성인식(전사)만 사용 */
+
+// 인식 세션 하나를 새 인스턴스로 시작 — 같은 인스턴스를 재시작하면
+// 일부 기기에서 이전 결과를 다시 재생(replay)해 전사가 반복되는 문제가 있다
+function startRecognizer() {
+  const r = new SR_CLASS();
+  r.lang = "en-US"; r.continuous = true; r.interimResults = true;
+  r.onresult = e => {
+    clearTimeout(R.watchdog);
+    // 이어붙이지 않고 이번 세션의 확정 조각 전체를 매번 처음부터 다시 조립:
+    // (1) 연속 중복 조각 제거 (2) 이전 세션 문장을 다시 보내는 에코 제거
+    const baseNorm = R.baseSegs.map(s => s.toLowerCase());
+    const segs = [];
+    let interim = "", prev = null;
+    for (let i = 0; i < e.results.length; i++) {
+      const t = (e.results[i][0].transcript || "").trim();
+      if (!t) continue;
+      if (e.results[i].isFinal) {
+        const tn = t.toLowerCase();
+        const isEcho = t.split(/\s+/).length >= 3 && baseNorm.includes(tn);
+        if (tn !== prev && !isEcho) segs.push(t);
+        prev = tn;
+      } else interim += t + " ";
+    }
+    R.sessionSegs = segs;
+    R.final = dedupeRepeats([...R.baseSegs, ...segs].join(" "));
+    const box = el("live-box");
+    if (box) box.textContent = dedupeRepeats((R.final + " " + interim).trim()) || "말씀하시면 여기에 영어 전사가 표시됩니다…";
+  };
+  r.onend = () => {
+    // 인식 세션이 끝나면(침묵 등) 확정 조각을 base로 옮기고 "새 인스턴스"로 재시작
+    if (R.sessionSegs.length) { R.baseSegs.push(...R.sessionSegs); R.sessionSegs = []; }
+    R.final = dedupeRepeats(R.baseSegs.join(" "));
+    if (R.keepAlive) { try { startRecognizer(); } catch {} }
+  };
+  // 삼성 인터넷 등: API는 있지만 인식 서비스가 없어 즉시 에러가 난다 → 감지 후 텍스트 입력 안내
+  r.onerror = e => {
+    if (["service-not-allowed", "not-allowed", "language-not-supported", "audio-capture", "network"].includes(e.error)) {
+      R.keepAlive = false;
+      S.srDead = true;
+      if (S.recording) render();
+    }
+  };
+  try { r.start(); } catch { S.srDead = true; }
+  R.recog = r;
+}
 async function startRecording() {
   S.micError = ""; S.emptyWarn = false;
   R.final = ""; R.baseSegs = []; R.sessionSegs = []; R.chunks = []; R.media = null;
@@ -901,46 +968,8 @@ async function startRecording() {
   }
 
   if (SR_CLASS && !S.srDead) {
-    const r = new SR_CLASS();
-    r.lang = "en-US"; r.continuous = true; r.interimResults = true;
-    r.onresult = e => {
-      clearTimeout(R.watchdog);
-      // 안드로이드는 같은 확정 결과를 반복해서 보내므로, 이어붙이지 않고
-      // 이번 세션의 확정 조각 전체를 매번 처음부터 다시 조립한다.
-      // (1) 연속 중복 조각 제거 (2) 재시작 후 이전 문장을 다시 보내는 에코 제거
-      const segs = [];
-      let interim = "", prev = null;
-      for (let i = 0; i < e.results.length; i++) {
-        const t = (e.results[i][0].transcript || "").trim();
-        if (!t) continue;
-        if (e.results[i].isFinal) {
-          const isEcho = t.split(/\s+/).length >= 3 && R.baseSegs.includes(t);
-          if (t !== prev && !isEcho) segs.push(t);
-          prev = t;
-        } else interim += t + " ";
-      }
-      R.sessionSegs = segs;
-      R.final = [...R.baseSegs, ...segs].join(" ");
-      const box = el("live-box");
-      if (box) box.textContent = (R.final + " " + interim).trim() || "말씀하시면 여기에 영어 전사가 표시됩니다…";
-    };
-    r.onend = () => {
-      // 인식 세션이 끝나면(침묵 등) 확정 조각을 base로 옮기고 재시작
-      if (R.sessionSegs.length) { R.baseSegs.push(...R.sessionSegs); R.sessionSegs = []; }
-      R.final = R.baseSegs.join(" ");
-      if (R.keepAlive) { try { r.start(); } catch {} }
-    };
-    // 삼성 인터넷 등: API는 있지만 인식 서비스가 없어 즉시 에러가 난다 → 감지 후 텍스트 입력 안내
-    r.onerror = e => {
-      if (["service-not-allowed", "not-allowed", "language-not-supported", "audio-capture", "network"].includes(e.error)) {
-        R.keepAlive = false;
-        S.srDead = true;
-        if (S.recording) render();
-      }
-    };
     R.keepAlive = true;
-    try { r.start(); } catch { S.srDead = true; }
-    R.recog = r;
+    startRecognizer();
     // 12초 동안 인식 결과가 전혀 없으면 미지원 브라우저로 간주하고 대안 안내
     clearTimeout(R.watchdog);
     R.watchdog = setTimeout(() => {
@@ -994,7 +1023,7 @@ async function submitAnswer() {
   const q = S.questions[S.qIdx];
   const manual = el("manual-text");
   const typed = (manual ? manual.value : "").trim();
-  const transcript = (R.final || typed).trim();
+  const transcript = dedupeRepeats((R.final || typed).trim());
   if (!transcript) {
     // 전사가 비었으면 그냥 넘기지 않고, 녹음은 보존한 채 직접 입력 기회를 준다
     R.pendingAudio = audioUrl; R.pendingDur = dur;
@@ -1182,7 +1211,8 @@ function renderHome() {
     </details>
 
     <div class="foot">기본 기능(음성인식·합성·분석·첨삭·기록)은 모두 브라우저 안에서 무료로 이뤄집니다 — 서버·유료 API 호출 없음.
-      AI 정밀 첨삭은 선택 기능으로, 본인이 발급한 무료 키로 동작합니다.
+      AI 정밀 첨삭은 선택 기능으로, 본인이 발급한 무료 키로 동작합니다. <b>빌드 ${APP_VER}</b> —
+      화면이 이 빌드 번호와 다르면 새로고침(당겨서 새로고침 또는 Ctrl+Shift+R)으로 최신 버전을 받아주세요.
       음성인식은 Chrome 내장 Web Speech API를 사용하며, 기록은 이 기기의 브라우저에만 저장됩니다.
       점수와 등급은 학습용 추정치로, 실제 OPIc 공식 채점과 다를 수 있습니다.
       마이크가 차단된 환경(일부 패널·인앱 브라우저)에서는 새 탭으로 열거나 텍스트 입력으로 연습하세요.</div>`;
@@ -1315,7 +1345,7 @@ function renderResult() {
         ${m.connectivesFound.length ? `<div class="used-good">✓ 사용한 연결 표현: ${m.connectivesFound.join(", ")}</div>` : ""}
         <div class="fb-list">${fb}</div>
         <div class="rev-zone">
-          <button class="btn ghost small" data-rev="${i}">✍️ AL 첨삭 — 수정 전/후 보기</button>
+          <button class="btn stop small" data-rev="${i}">✍️ AL 첨삭 — 수정 전/후 보기</button>
           ${getAiKey()
             ? `<button class="btn ghost small" data-airev="${i}">🤖 AI 정밀 첨삭 (문법·논리)</button>`
             : `<span class="rev-hint">문법·논리까지 잡는 AI 정밀 첨삭은 홈 하단에서 무료 키 등록 후 사용 가능</span>`}
