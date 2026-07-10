@@ -803,40 +803,45 @@ function revisionHTML(orig, corrected, issues, logicNotes, title) {
 /* ══════════════ AI 정밀 첨삭 (선택 — 본인 무료 API 키) ══════════════ */
 function getAiKey() { try { return localStorage.getItem("opic_gemini_key") || ""; } catch { return ""; } }
 
-// 키에서 실제로 쓸 수 있는 모델을 한 번 찾아 캐시 (모델 이름은 키/시점마다 다를 수 있음)
-const AI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-2.0-flash-001", "gemini-1.5-flash"];
-async function resolveModel(key) {
-  const cached = (() => { try { return localStorage.getItem("opic_gemini_model") || ""; } catch { return ""; } })();
-  if (cached) return cached;
-  // ListModels로 이 키가 실제로 쓸 수 있는 모델을 조회
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
-    if (r.ok) {
-      const j = await r.json();
-      const usable = (j.models || [])
-        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
-        .map(m => m.name.replace(/^models\//, ""));
-      const pick = AI_MODEL_CANDIDATES.find(c => usable.includes(c))
-        || usable.find(m => /flash/.test(m) && !/vision|thinking|image|tts|embedding/.test(m))
-        || usable[0];
-      if (pick) { try { localStorage.setItem("opic_gemini_model", pick); } catch {} return pick; }
-    } else {
-      const body = await r.text();
-      throw new Error(`키 확인 실패 (HTTP ${r.status}) — ${extractApiError(body)}`);
-    }
-  } catch (e) { if (e.message.startsWith("키 확인")) throw e; }
-  return AI_MODEL_CANDIDATES[1]; // 폴백
-}
+// 모델 이름은 Google이 수시로 바꾸고, 일부는 "신규 사용자 차단" 상태라
+// 목록 조회만으로는 알 수 없다 → 실제로 호출해서 되는 모델을 찾아 캐시한다.
+const AI_MODEL_CANDIDATES = [
+  "gemini-2.0-flash", "gemini-flash-latest", "gemini-2.5-flash-lite",
+  "gemini-2.0-flash-001", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-pro-latest",
+];
 
 function extractApiError(bodyText) {
-  try { const j = JSON.parse(bodyText); return j?.error?.message || bodyText.slice(0, 160); }
-  catch { return (bodyText || "").slice(0, 160); }
+  try { const j = JSON.parse(bodyText); return j?.error?.message || bodyText.slice(0, 200); }
+  catch { return (bodyText || "").slice(0, 200); }
+}
+
+// 이 키로 generateContent가 가능한 모델 이름들을 목록에서 수집(후보 확장용)
+async function listUsableModels(key) {
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.models || [])
+      .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map(m => m.name.replace(/^models\//, ""))
+      .filter(m => /flash|pro/.test(m) && !/vision|thinking|image|tts|embedding|learnlm|exp/.test(m));
+  } catch { return []; }
+}
+
+async function callGemini(model, key, prompt) {
+  return fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.4, responseMimeType: "application/json" },
+      }) }
+  );
 }
 
 async function aiReview(transcript, question) {
   const key = getAiKey();
   if (!key) throw new Error("API 키가 등록되지 않았어요. 홈 하단에서 키를 저장해 주세요.");
-  const model = await resolveModel(key);
   const prompt = `You are a strict but encouraging OPIc examiner. Target level: AL (Advanced Low).
 This is a Korean learner's spoken answer, transcribed by speech-to-text (punctuation and small words may be wrong).
 
@@ -857,33 +862,49 @@ Respond with ONLY a JSON object (no markdown, no code fence), exactly:
  "tips": ["이 답변을 AL로 끌어올릴 핵심 조언을 한국어로 (최대 2개)"]
 }
 Include at least 3 grammar items if any errors exist. Base every "from" on text that actually appears in the transcript.`;
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
-    { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.4, responseMimeType: "application/json" },
-      }) }
-  );
-  if (!res.ok) {
+
+  // 후보 목록: (1) 지난번 성공 모델 (2) 하드코딩 후보 (3) 이 키의 목록에서 발견한 모델
+  const cached = (() => { try { return localStorage.getItem("opic_gemini_model") || ""; } catch { return ""; } })();
+  let candidates = [];
+  if (cached) candidates.push(cached);
+  candidates.push(...AI_MODEL_CANDIDATES);
+  for (const m of await listUsableModels(key)) if (!candidates.includes(m)) candidates.push(m);
+  candidates = [...new Set(candidates)];
+
+  let lastErr = "사용 가능한 모델을 찾지 못했어요";
+  for (const model of candidates) {
+    let res;
+    try { res = await callGemini(model, key, prompt); }
+    catch { lastErr = "네트워크 오류 — 인터넷 연결을 확인해 주세요"; continue; }
+
+    if (res.ok) {
+      try { localStorage.setItem("opic_gemini_model", model); } catch {}
+      const data = await res.json();
+      const cand = data?.candidates?.[0];
+      if (cand?.finishReason === "SAFETY") throw new Error("안전 필터에 걸렸어요. 다른 답변으로 시도해 주세요.");
+      let raw = (cand?.content?.parts || []).map(p => p.text || "").join("").trim();
+      if (!raw) throw new Error("응답이 비어 있어요. 답변을 조금 더 길게 말한 뒤 다시 시도해 주세요.");
+      raw = raw.replace(/^```(json)?/i, "").replace(/```\s*$/i, "").trim();
+      const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+      if (s >= 0 && e > s) raw = raw.slice(s, e + 1);
+      let parsed;
+      try { parsed = JSON.parse(raw); }
+      catch { throw new Error("AI 응답 형식을 해석하지 못했어요. 다시 시도해 주세요."); }
+      if (!parsed.corrected) throw new Error("교정 결과가 비어 있어요. 다시 시도해 주세요.");
+      return parsed;
+    }
+
     const body = await res.text();
-    try { localStorage.removeItem("opic_gemini_model"); } catch {} // 다음 시도에 모델 재탐색
+    const msg = extractApiError(body);
+    // 키·사용량 오류는 모델을 바꿔도 동일 → 즉시 중단하고 원인 안내
     if (res.status === 429) throw new Error("무료 사용량을 잠시 초과했어요. 1분 후 다시 시도해 주세요.");
-    throw new Error(`요청 실패 (HTTP ${res.status}) — ${extractApiError(body)}`);
+    if ((res.status === 400 || res.status === 403) && /api key|permission|invalid/i.test(msg))
+      throw new Error("API 키 문제 — " + msg);
+    // 그 외(404, 모델 미제공 등)는 다음 후보로
+    try { localStorage.removeItem("opic_gemini_model"); } catch {}
+    lastErr = `HTTP ${res.status} — ${msg}`;
   }
-  const data = await res.json();
-  const cand = data?.candidates?.[0];
-  if (cand?.finishReason === "SAFETY") throw new Error("안전 필터에 걸렸어요. 다른 답변으로 시도해 주세요.");
-  let raw = (cand?.content?.parts || []).map(p => p.text || "").join("").trim();
-  if (!raw) throw new Error("응답이 비어 있어요. 답변을 조금 더 길게 말한 뒤 다시 시도해 주세요.");
-  raw = raw.replace(/^```(json)?/i, "").replace(/```\s*$/i, "").trim();
-  const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
-  if (s >= 0 && e > s) raw = raw.slice(s, e + 1);
-  let parsed;
-  try { parsed = JSON.parse(raw); }
-  catch { throw new Error("AI 응답 형식을 해석하지 못했어요. 다시 시도해 주세요."); }
-  if (!parsed.corrected) throw new Error("교정 결과가 비어 있어요. 다시 시도해 주세요.");
-  return parsed;
+  throw new Error(lastErr);
 }
 
 /* ══════════════ 저장소 (localStorage) ══════════════ */
@@ -900,7 +921,7 @@ function calcStreak(sessions) {
 }
 
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
-const APP_VER = "v8";
+const APP_VER = "v9";
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
