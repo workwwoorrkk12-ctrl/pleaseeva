@@ -282,6 +282,10 @@
   .rev-hint { font-size: 11px; color: var(--muted); }
   .rev-out { width: 100%; }
   .rev-title { font-size: 11.5px; color: var(--muted); margin: 10px 0 6px; }
+  .ai-badge {
+    display: inline-block; margin: 10px 0 2px; font-size: 12px; font-weight: 600;
+    color: var(--bg); background: var(--accent); border-radius: 6px; padding: 4px 10px;
+  }
   .rev-diff {
     font-size: 13px; line-height: 2; color: var(--text);
     background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
@@ -799,35 +803,87 @@ function revisionHTML(orig, corrected, issues, logicNotes, title) {
 /* ══════════════ AI 정밀 첨삭 (선택 — 본인 무료 API 키) ══════════════ */
 function getAiKey() { try { return localStorage.getItem("opic_gemini_key") || ""; } catch { return ""; } }
 
+// 키에서 실제로 쓸 수 있는 모델을 한 번 찾아 캐시 (모델 이름은 키/시점마다 다를 수 있음)
+const AI_MODEL_CANDIDATES = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest", "gemini-2.0-flash-001", "gemini-1.5-flash"];
+async function resolveModel(key) {
+  const cached = (() => { try { return localStorage.getItem("opic_gemini_model") || ""; } catch { return ""; } })();
+  if (cached) return cached;
+  // ListModels로 이 키가 실제로 쓸 수 있는 모델을 조회
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`);
+    if (r.ok) {
+      const j = await r.json();
+      const usable = (j.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes("generateContent"))
+        .map(m => m.name.replace(/^models\//, ""));
+      const pick = AI_MODEL_CANDIDATES.find(c => usable.includes(c))
+        || usable.find(m => /flash/.test(m) && !/vision|thinking|image|tts|embedding/.test(m))
+        || usable[0];
+      if (pick) { try { localStorage.setItem("opic_gemini_model", pick); } catch {} return pick; }
+    } else {
+      const body = await r.text();
+      throw new Error(`키 확인 실패 (HTTP ${r.status}) — ${extractApiError(body)}`);
+    }
+  } catch (e) { if (e.message.startsWith("키 확인")) throw e; }
+  return AI_MODEL_CANDIDATES[1]; // 폴백
+}
+
+function extractApiError(bodyText) {
+  try { const j = JSON.parse(bodyText); return j?.error?.message || bodyText.slice(0, 160); }
+  catch { return (bodyText || "").slice(0, 160); }
+}
+
 async function aiReview(transcript, question) {
   const key = getAiKey();
-  const prompt = `You are a strict OPIc rater targeting the AL (Advanced Low) level.
-The student answered this OPIc question (speech-to-text transcript, punctuation may be missing):
+  if (!key) throw new Error("API 키가 등록되지 않았어요. 홈 하단에서 키를 저장해 주세요.");
+  const model = await resolveModel(key);
+  const prompt = `You are a strict but encouraging OPIc examiner. Target level: AL (Advanced Low).
+This is a Korean learner's spoken answer, transcribed by speech-to-text (punctuation and small words may be wrong).
 
 QUESTION: ${question.text}
-ANSWER TRANSCRIPT: ${transcript}
+ANSWER (transcript): ${transcript}
 
-Return ONLY valid JSON (no markdown fence) with this exact shape:
+Do a THOROUGH correction. You MUST:
+- Fix every grammar error (articles, verb tense, subject-verb agreement, prepositions, plurals, word form).
+- Fix awkward or unnatural phrasing so it sounds like a fluent speaker.
+- Improve logic and flow, add a concrete example if the answer is vague, but KEEP the learner's own ideas.
+- Do NOT just add connective words — actually rewrite sentences to a higher level.
+
+Respond with ONLY a JSON object (no markdown, no code fence), exactly:
 {
- "corrected": "<the full answer rewritten at AL level: fix ALL grammar errors, fix tense, improve logic/flow, keep the student's original ideas and length similar>",
- "grammar": [{"from":"<original phrase>","to":"<fixed phrase>","why":"<한국어로 이유 한 문장>"}],
- "logic": ["<내용·논리 문제점과 개선 방법을 한국어로, 최대 3개>"],
- "tips": ["<이 답변을 AL로 올리기 위한 핵심 조언을 한국어로, 최대 2개>"]
-}`;
+ "corrected": "the full answer rewritten at natural AL level, with proper punctuation",
+ "grammar": [{"from":"exact wrong phrase from the transcript","to":"corrected phrase","why":"한국어로 왜 틀렸는지 한 문장"}],
+ "logic": ["내용·논리·구성에 대한 지적과 개선책을 한국어로 (최대 3개)"],
+ "tips": ["이 답변을 AL로 끌어올릴 핵심 조언을 한국어로 (최대 2개)"]
+}
+Include at least 3 grammar items if any errors exist. Base every "from" on text that actually appears in the transcript.`;
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`,
     { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.3 } }) }
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.4, responseMimeType: "application/json" },
+      }) }
   );
   if (!res.ok) {
-    if (res.status === 400 || res.status === 403) throw new Error("API 키가 올바르지 않아요. 키를 다시 확인해 주세요.");
+    const body = await res.text();
+    try { localStorage.removeItem("opic_gemini_model"); } catch {} // 다음 시도에 모델 재탐색
     if (res.status === 429) throw new Error("무료 사용량을 잠시 초과했어요. 1분 후 다시 시도해 주세요.");
-    throw new Error(`요청 실패 (HTTP ${res.status})`);
+    throw new Error(`요청 실패 (HTTP ${res.status}) — ${extractApiError(body)}`);
   }
   const data = await res.json();
-  let raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  raw = raw.replace(/^```(json)?/m, "").replace(/```\s*$/m, "").trim();
-  return JSON.parse(raw);
+  const cand = data?.candidates?.[0];
+  if (cand?.finishReason === "SAFETY") throw new Error("안전 필터에 걸렸어요. 다른 답변으로 시도해 주세요.");
+  let raw = (cand?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!raw) throw new Error("응답이 비어 있어요. 답변을 조금 더 길게 말한 뒤 다시 시도해 주세요.");
+  raw = raw.replace(/^```(json)?/i, "").replace(/```\s*$/i, "").trim();
+  const s = raw.indexOf("{"), e = raw.lastIndexOf("}");
+  if (s >= 0 && e > s) raw = raw.slice(s, e + 1);
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { throw new Error("AI 응답 형식을 해석하지 못했어요. 다시 시도해 주세요."); }
+  if (!parsed.corrected) throw new Error("교정 결과가 비어 있어요. 다시 시도해 주세요.");
+  return parsed;
 }
 
 /* ══════════════ 저장소 (localStorage) ══════════════ */
@@ -844,7 +900,7 @@ function calcStreak(sessions) {
 }
 
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
-const APP_VER = "v7";
+const APP_VER = "v8";
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
@@ -1237,6 +1293,7 @@ function renderHome() {
         <div class="ai-row">
           <input id="ai-key" type="password" placeholder="AIza… 형식의 API 키 붙여넣기" autocomplete="off">
           <button class="btn small" id="ai-save">저장</button>
+          <button class="btn ghost small" id="ai-test">연결 테스트</button>
           <button class="btn ghost small" id="ai-del">삭제</button>
           <span id="ai-msg" class="ai-msg"></span>
         </div>
@@ -1261,16 +1318,28 @@ function renderHome() {
   const tt = el("tbl-toggle");
   if (tt) tt.onclick = () => { S.trendTable = !S.trendTable; render(); };
   el("ai-key").value = getAiKey();
+  const aiMsg = (t, ok) => { const m = el("ai-msg"); m.textContent = t; m.style.color = ok === false ? "var(--bad)" : "var(--good)"; };
   el("ai-save").onclick = () => {
     const v = el("ai-key").value.trim();
-    if (!v) { el("ai-msg").textContent = "키를 입력해 주세요"; return; }
-    try { localStorage.setItem("opic_gemini_key", v); } catch {}
-    el("ai-msg").textContent = "저장됨 ✓ 이제 결과 화면에서 AI 정밀 첨삭을 쓸 수 있어요";
+    if (!v) return aiMsg("키를 입력해 주세요", false);
+    try { localStorage.setItem("opic_gemini_key", v); localStorage.removeItem("opic_gemini_model"); } catch {}
+    aiMsg("저장됨 ✓ '연결 테스트'로 확인해 보세요");
+  };
+  el("ai-test").onclick = async () => {
+    const v = el("ai-key").value.trim();
+    if (v) { try { localStorage.setItem("opic_gemini_key", v); localStorage.removeItem("opic_gemini_model"); } catch {} }
+    if (!getAiKey()) return aiMsg("먼저 키를 입력·저장해 주세요", false);
+    aiMsg("테스트 중…", true);
+    try {
+      const r = await aiReview("I go to park yesterday and I meet my friend it was very fun",
+        { text: "Tell me about a memorable experience.", type: "experience", tense: "past" });
+      aiMsg(`정상 작동 ✓ 예시 교정: "${(r.corrected || "").slice(0, 40)}…"`);
+    } catch (e) { aiMsg("실패: " + e.message, false); }
   };
   el("ai-del").onclick = () => {
-    try { localStorage.removeItem("opic_gemini_key"); } catch {}
+    try { localStorage.removeItem("opic_gemini_key"); localStorage.removeItem("opic_gemini_model"); } catch {}
     el("ai-key").value = "";
-    el("ai-msg").textContent = "삭제됨";
+    aiMsg("삭제됨");
   };
   bindTrendHover(recent);
 }
@@ -1379,10 +1448,11 @@ function renderResult() {
         ${m.connectivesFound.length ? `<div class="used-good">✓ 사용한 연결 표현: ${m.connectivesFound.join(", ")}</div>` : ""}
         <div class="fb-list">${fb}</div>
         <div class="rev-zone">
-          <button class="btn stop small" data-rev="${i}">✍️ AL 첨삭 — 수정 전/후 보기</button>
           ${getAiKey()
-            ? `<button class="btn ghost small" data-airev="${i}">🤖 AI 정밀 첨삭 (문법·논리)</button>`
-            : `<span class="rev-hint">문법·논리까지 잡는 AI 정밀 첨삭은 홈 하단에서 무료 키 등록 후 사용 가능</span>`}
+            ? `<button class="btn stop small" data-airev="${i}">🤖 AI 정밀 첨삭 (문법·논리 전체 교정)</button>
+               <button class="btn ghost small" data-rev="${i}">✍️ 기본 첨삭 (규칙 기반)</button>`
+            : `<button class="btn stop small" data-rev="${i}">✍️ AL 첨삭 — 수정 전/후 보기</button>
+               <span class="rev-hint">문법·논리까지 완전히 잡는 AI 정밀 첨삭은 홈 하단에서 무료 키 등록 후 사용 가능</span>`}
           <div class="rev-out" id="rev-${i}"></div>
         </div>
       </div></div>`;
@@ -1422,17 +1492,19 @@ function renderResult() {
   document.querySelectorAll("[data-airev]").forEach(b => {
     b.onclick = async () => {
       const i = +b.dataset.airev, a = S.answers[i], out = el("rev-" + i);
-      b.disabled = true; b.textContent = "🤖 AI 분석 중…";
+      b.disabled = true; b.textContent = "🤖 AI 분석 중… (몇 초 걸려요)";
+      out.innerHTML = `<p class="rev-title">🤖 Gemini가 문법·논리를 검토하는 중…</p>`;
       try {
         const r = await aiReview(a.transcript, a.q);
         const issues = (r.grammar || []).map(g => ({ kind: "문법", from: g.from, to: g.to, note: g.why }));
-        out.innerHTML = revisionHTML(a.transcript, r.corrected || a.transcript, issues,
-          [...(r.logic || []), ...(r.tips || [])], "AI 정밀 첨삭 — 문법·내용 논리까지 검토한 결과");
+        out.innerHTML = `<div class="ai-badge">🤖 AI 정밀 첨삭 결과 (Gemini)</div>` +
+          revisionHTML(a.transcript, r.corrected || a.transcript, issues,
+            [...(r.logic || []), ...(r.tips || [])], "문법·내용 논리까지 검토한 교정입니다");
         out.dataset.mode = "ai";
       } catch (e) {
-        out.innerHTML = `<p class="mic-err">⚠ ${esc(e.message)}</p>`;
+        out.innerHTML = `<p class="mic-err">⚠ AI 첨삭 실패: ${esc(e.message)}</p><p class="rev-hint">이 메시지를 그대로 복사해 알려주시면 원인을 바로 잡을 수 있어요. 우선 아래 기본 첨삭을 이용하세요.</p>`;
       }
-      b.disabled = false; b.textContent = "🤖 AI 정밀 첨삭 (문법·논리)";
+      b.disabled = false; b.textContent = "🤖 AI 정밀 첨삭 (문법·논리 전체 교정)";
     };
   });
   document.querySelectorAll("[data-toggle]").forEach(b => {
