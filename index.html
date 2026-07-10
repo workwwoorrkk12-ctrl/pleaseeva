@@ -328,6 +328,7 @@
     background: var(--panel-2); color: var(--text);
   }
   .ai-msg { font-size: 11.5px; color: var(--good); }
+  .ai-diag { margin-top: 8px; font-size: 11px; color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
 
   .trend-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .trend-title { font-size: 13px; }
@@ -871,11 +872,13 @@ Include at least 3 grammar items if any errors exist. Base every "from" on text 
   for (const m of await listUsableModels(key)) if (!candidates.includes(m)) candidates.push(m);
   candidates = [...new Set(candidates)];
 
-  let lastErr = "사용 가능한 모델을 찾지 못했어요";
+  const attempts = [];   // 진단용: 모델별 결과
+  let anyPerDay = false, anyPerMin = false, keyError = "";
+
   for (const model of candidates) {
     let res;
     try { res = await callGemini(model, key, prompt); }
-    catch { lastErr = "네트워크 오류 — 인터넷 연결을 확인해 주세요"; continue; }
+    catch { attempts.push({ model, status: "net", msg: "네트워크 오류" }); continue; }
 
     if (res.ok) {
       try { localStorage.setItem("opic_gemini_model", model); } catch {}
@@ -891,25 +894,39 @@ Include at least 3 grammar items if any errors exist. Base every "from" on text 
       try { parsed = JSON.parse(raw); }
       catch { throw new Error("AI 응답 형식을 해석하지 못했어요. 다시 시도해 주세요."); }
       if (!parsed.corrected) throw new Error("교정 결과가 비어 있어요. 다시 시도해 주세요.");
+      parsed.__model = model;
       return parsed;
     }
 
     const body = await res.text();
     const msg = extractApiError(body);
-    // 키·사용량 오류는 모델을 바꿔도 동일 → 즉시 중단하고 원인 안내
-    if (res.status === 429) {
-      const perDay = /per day|perday|daily|requests per day/i.test(body);
-      throw new Error(perDay
-        ? "오늘 이 키의 무료 하루 한도를 다 썼어요. 내일 리셋되며, 급하면 다른 구글 계정으로 키를 하나 더 만들어 바꿔 넣으면 바로 됩니다."
-        : "짧은 시간에 요청이 몰려 분당 무료 한도에 걸렸어요. 1~2분 기다렸다가 딱 한 번만 다시 눌러 주세요 (연속 클릭은 오히려 한도를 더 씁니다).");
+    attempts.push({ model, status: res.status, msg });
+    // 키 오류는 모든 모델에 공통 → 즉시 중단
+    if ((res.status === 400 || res.status === 403) && /api key|permission|invalid|denied/i.test(msg)) {
+      keyError = msg; break;
     }
-    if ((res.status === 400 || res.status === 403) && /api key|permission|invalid/i.test(msg))
-      throw new Error("API 키 문제 — " + msg);
-    // 그 외(404, 모델 미제공 등)는 다음 후보로
+    if (res.status === 429) {
+      if (/per day|perday|daily|requests per day|GenerateRequestsPerDay/i.test(body)) anyPerDay = true;
+      else anyPerMin = true;
+    }
+    // 429·404 등은 다음 후보로 계속 (모델마다 할당량이 다르므로)
     try { localStorage.removeItem("opic_gemini_model"); } catch {}
-    lastErr = `HTTP ${res.status} — ${msg}`;
   }
-  throw new Error(lastErr);
+
+  // 모든 후보 실패 → 원인 종합
+  if (keyError) throw makeAiError("API 키에 문제가 있어요 — " + keyError, attempts);
+  if (anyPerMin && !anyPerDay)
+    throw makeAiError("분당 무료 한도에 걸렸어요. 1~2분 기다렸다가 딱 한 번만 다시 눌러 주세요.", attempts);
+  if (anyPerDay)
+    throw makeAiError("이 키로 지금 쓸 수 있는 모델의 무료 하루 한도가 모두 소진됐어요. 보통 태평양시간 자정(한국 오후 4~5시)에 리셋됩니다. 급하면 다른 구글 계정으로 키를 하나 더 만들어 바꿔 넣으세요.", attempts);
+  throw makeAiError("사용 가능한 모델을 찾지 못했어요.", attempts);
+}
+
+// 에러에 진단 정보를 붙인다 (연결 테스트에서 모델별 결과를 보여주기 위함)
+function makeAiError(message, attempts) {
+  const e = new Error(message);
+  e.attempts = attempts || [];
+  return e;
 }
 
 /* ══════════════ 저장소 (localStorage) ══════════════ */
@@ -926,7 +943,7 @@ function calcStreak(sessions) {
 }
 
 /* ══════════════ 앱 상태 + 렌더 ══════════════ */
-const APP_VER = "v10";
+const APP_VER = "v11";
 const app = document.getElementById("app");
 const SR_CLASS = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 // 삼성 인터넷 등 일부 크로뮴 계열은 API가 존재해도 실제 인식이 동작하지 않는다
@@ -1323,6 +1340,7 @@ function renderHome() {
           <button class="btn ghost small" id="ai-del">삭제</button>
           <span id="ai-msg" class="ai-msg"></span>
         </div>
+        <div id="ai-diag" class="ai-diag"></div>
       </div>
     </details>
 
@@ -1355,12 +1373,20 @@ function renderHome() {
     const v = el("ai-key").value.trim();
     if (v) { try { localStorage.setItem("opic_gemini_key", v); localStorage.removeItem("opic_gemini_model"); } catch {} }
     if (!getAiKey()) return aiMsg("먼저 키를 입력·저장해 주세요", false);
-    aiMsg("테스트 중…", true);
+    aiMsg("테스트 중… (여러 모델을 확인하느라 몇 초 걸려요)", true);
+    const diag = el("ai-diag");
+    diag.innerHTML = "";
     try {
       const r = await aiReview("I go to park yesterday and I meet my friend it was very fun",
         { text: "Tell me about a memorable experience.", type: "experience", tense: "past" });
-      aiMsg(`정상 작동 ✓ 예시 교정: "${(r.corrected || "").slice(0, 40)}…"`);
-    } catch (e) { aiMsg("실패: " + e.message, false); }
+      aiMsg(`정상 작동 ✓ (모델: ${r.__model}) 예시 교정: "${(r.corrected || "").slice(0, 36)}…"`);
+    } catch (e) {
+      aiMsg("실패: " + e.message, false);
+      if (e.attempts && e.attempts.length) {
+        diag.innerHTML = "<b>모델별 결과:</b><br>" + e.attempts
+          .map(a => `· ${esc(a.model)} → ${a.status} ${esc((a.msg || "").slice(0, 60))}`).join("<br>");
+      }
+    }
   };
   el("ai-del").onclick = () => {
     try { localStorage.removeItem("opic_gemini_key"); localStorage.removeItem("opic_gemini_model"); } catch {}
@@ -1523,12 +1549,20 @@ function renderResult() {
       try {
         const r = await aiReview(a.transcript, a.q);
         const issues = (r.grammar || []).map(g => ({ kind: "문법", from: g.from, to: g.to, note: g.why }));
-        out.innerHTML = `<div class="ai-badge">🤖 AI 정밀 첨삭 결과 (Gemini)</div>` +
+        out.innerHTML = `<div class="ai-badge">🤖 AI 정밀 첨삭 결과 (${esc(r.__model || "Gemini")})</div>` +
           revisionHTML(a.transcript, r.corrected || a.transcript, issues,
             [...(r.logic || []), ...(r.tips || [])], "문법·내용 논리까지 검토한 교정입니다");
         out.dataset.mode = "ai";
       } catch (e) {
-        out.innerHTML = `<p class="mic-err">⚠ AI 첨삭 실패: ${esc(e.message)}</p><p class="rev-hint">이 메시지를 그대로 복사해 알려주시면 원인을 바로 잡을 수 있어요. 우선 아래 기본 첨삭을 이용하세요.</p>`;
+        const diag = (e.attempts && e.attempts.length)
+          ? `<div class="ai-diag">${e.attempts.map(a2 => `· ${esc(a2.model)} → ${a2.status}`).join("<br>")}</div>` : "";
+        out.innerHTML = `<p class="mic-err">⚠ AI 첨삭 실패: ${esc(e.message)}</p>${diag}<p class="rev-hint">우선 아래 기본 첨삭을 이용하세요. 문제가 계속되면 위 내용을 복사해 알려주세요.</p>
+          <button class="btn ghost small" data-rev="${i}">✍️ 기본 첨삭으로 보기</button>`;
+        const rb = out.querySelector("[data-rev]");
+        if (rb) rb.onclick = () => {
+          const { corrected, issues } = upgradeToAL(a.transcript, a.q);
+          out.innerHTML = revisionHTML(a.transcript, corrected, issues, buildLogicNotes(a.transcript, a.q), "기본 첨삭 (규칙 기반)");
+        };
       }
       b.disabled = false; b.textContent = "🤖 AI 정밀 첨삭 (문법·논리 전체 교정)";
     };
